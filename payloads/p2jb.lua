@@ -642,7 +642,7 @@ function p2jb_ps5()
     -- that does BATCH_SIZE syscalls and trigger it with call_rop_internal().
     -- =========================================================================
 
-    local BATCH_SIZE = 80
+    local BATCH_SIZE = 400
     local kqex_path = 0x800000000000
     local syscall_addr = get_syscall_wrapper(0x8D)
 
